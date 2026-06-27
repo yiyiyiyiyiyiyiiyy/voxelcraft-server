@@ -1,14 +1,22 @@
-// VoxelCraft Relay + Persistence Server (with player state persistence)
-// =================================================================
+// VoxelCraft Relay + Persistence Server
+// =====================================
 //
-// Stores per-room:
-//   1. World state (modified blocks) — in `rooms.json`
-//   2. Player state (position, inventory, health, etc.) — in `players.json`
+// A lightweight WebSocket server that:
+//   1. Relays messages between players in the same room (so multiplayer
+//      works even behind strict NATs that block WebRTC).
+//   2. Persists world state (modified blocks) per room in memory + on disk,
+//      so the world survives even when NO players are online.
+//   3. Sends the full world state to any player who joins a room.
 //
-// When a player joins with a name that has played in this room before,
-// they get their previous position + inventory back.
+// Deployment:
+//   - Render:  https://render.com  (free tier available)
+//   - Railway: https://railway.app (free trial, then ~$5/month)
+//   - Fly.io:  https://fly.io      (free tier available)
 //
-// =================================================================
+// After deploying, set the SERVER_URL in your HTML file to your deployed URL:
+//   const SERVER_URL = 'wss://your-app-name.onrender.com';
+//
+// =====================================
 
 const http = require('http');
 const fs = require('fs');
@@ -17,86 +25,49 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 
-// rooms: roomCode -> { blocks: Map<"x,y,z", blockType>, seed, lastModified }
-// players: roomCode -> Map<playerName, { position, inventory, health, hunger, gamemode, ... }>
+// In-memory world state: roomCode -> { blocks: Map<"x,y,z", blockType>, seed, lastModified }
+// This is periodically saved to disk so it survives server restarts.
 const rooms = new Map();
-const players = new Map();
 
+// Load saved rooms from disk on startup
 const DATA_FILE = path.join(__dirname, 'rooms.json');
-const PLAYERS_FILE = path.join(__dirname, 'players.json');
-
 function loadRooms() {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       const data = JSON.parse(raw);
       for (const [code, room] of Object.entries(data)) {
-        rooms.set(code, {
-          blocks: new Map(room.blocks),
-          seed: room.seed,
-          lastModified: room.lastModified
-        });
+        const blocks = new Map(room.blocks);
+        rooms.set(code, { blocks, seed: room.seed, lastModified: room.lastModified });
       }
       console.log(`[Server] Loaded ${rooms.size} rooms from disk`);
     }
   } catch (e) {
-    console.error('[Server] Load rooms error:', e.message);
+    console.error('[Server] Load error:', e.message);
   }
 }
 
-function loadPlayers() {
-  try {
-    if (fs.existsSync(PLAYERS_FILE)) {
-      const raw = fs.readFileSync(PLAYERS_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      for (const [code, entries] of Object.entries(data)) {
-        const playerMap = new Map();
-        for (const [pname, pdata] of Object.entries(entries)) {
-          playerMap.set(pname, pdata);
-        }
-        players.set(code, playerMap);
-      }
-      console.log(`[Server] Loaded player state for ${players.size} rooms from disk`);
-    }
-  } catch (e) {
-    console.error('[Server] Load players error:', e.message);
-  }
-}
-
+// Save rooms to disk (throttled)
 let saveTimer = null;
 function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    saveAll();
-  }, 5000);
-}
-
-function saveAll() {
-  try {
-    const roomsData = {};
+    const data = {};
     for (const [code, room] of rooms) {
-      roomsData[code] = {
+      data[code] = {
         blocks: Array.from(room.blocks.entries()),
         seed: room.seed,
         lastModified: room.lastModified
       };
     }
-    fs.writeFileSync(DATA_FILE, JSON.stringify(roomsData));
-  } catch (e) {
-    console.error('[Server] Save rooms error:', e.message);
-  }
-  try {
-    const playersData = {};
-    for (const [code, playerMap] of players) {
-      playersData[code] = Object.fromEntries(playerMap.entries());
-    }
-    fs.writeFileSync(PLAYERS_FILE, JSON.stringify(playersData));
-  } catch (e) {
-    console.error('[Server] Save players error:', e.message);
-  }
+    fs.writeFile(DATA_FILE, JSON.stringify(data), (err) => {
+      if (err) console.error('[Server] Save error:', err.message);
+    });
+  }, 5000);
 }
 
+// Get or create a room
 function getRoom(code) {
   let room = rooms.get(code);
   if (!room) {
@@ -106,15 +77,7 @@ function getRoom(code) {
   return room;
 }
 
-function getPlayers(code) {
-  let playerMap = players.get(code);
-  if (!playerMap) {
-    playerMap = new Map();
-    players.set(code, playerMap);
-  }
-  return playerMap;
-}
-
+// Track WebSocket connections per room: roomCode -> Set<WebSocket>
 const roomClients = new Map();
 
 function getClients(code) {
@@ -130,20 +93,20 @@ function broadcast(code, message, except = null) {
   const clients = getClients(code);
   const data = JSON.stringify(message);
   for (const client of clients) {
-    if (client !== except && client.readyState === 1) {
+    if (client !== except && client.readyState === 1) { // OPEN
       client.send(data);
     }
   }
 }
 
+// Create HTTP server (for health checks + serving the game if you want)
 const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/keepalive') {
+  if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       rooms: rooms.size,
       totalBlocks: Array.from(rooms.values()).reduce((sum, r) => sum + r.blocks.size, 0),
-      totalPlayers: Array.from(players.values()).reduce((sum, p) => sum + p.size, 0),
       uptime: process.uptime()
     }));
     return;
@@ -152,6 +115,7 @@ const server = http.createServer((req, res) => {
   res.end('VoxelCraft server running. Connect via WebSocket.');
 });
 
+// Create WebSocket server
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
@@ -162,11 +126,16 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch (e) { return; }
+    try {
+      msg = JSON.parse(raw);
+    } catch (e) {
+      return;
+    }
     if (!msg.type) return;
 
-    // === JOIN ===
+    // === JOIN: player joins a room ===
     if (msg.type === 'join') {
+      // Leave previous room if any
       if (currentRoom) {
         const clients = getClients(currentRoom);
         clients.delete(ws);
@@ -182,16 +151,16 @@ wss.on('connection', (ws) => {
 
       console.log(`[Server] ${playerName} joined room ${currentRoom} (${clients.size} players)`);
 
+      // Send the full world state to the joining player
       const room = getRoom(currentRoom);
       if (msg.seed) room.seed = msg.seed;
-
-      // 1. Send world state (all modified blocks) in chunks of 500
       const blocks = Array.from(room.blocks.entries()).map(([key, type]) => {
         const parts = key.split(',');
         return [parseInt(parts[0]), parseInt(parts[1]), parseInt(parts[2]), type];
       });
+
+      // Send in chunks of 500 (to stay under message size limits)
       const CHUNK = 500;
-      const hasSavedPlayer = getPlayers(currentRoom).has(playerName);
       for (let i = 0; i < blocks.length; i += CHUNK) {
         const chunk = blocks.slice(i, i + CHUNK);
         const isLast = i + CHUNK >= blocks.length;
@@ -204,32 +173,11 @@ wss.on('connection', (ws) => {
           totalChunks: Math.ceil(blocks.length / CHUNK)
         }));
       }
-      // If no blocks at all, send an empty done message
-      if (blocks.length === 0) {
-        ws.send(JSON.stringify({
-          type: 'world-sync',
-          blocks: [],
-          done: true,
-          totalBlocks: 0
-        }));
-      }
 
-      // 2. Send the player's saved state if it exists (position + inventory)
-      const playerMap = getPlayers(currentRoom);
-      const savedPlayer = playerMap.get(playerName);
-      if (savedPlayer) {
-        ws.send(JSON.stringify({
-          type: 'player-state',
-          state: savedPlayer,
-          welcome: 'Welcome back! Your progress has been restored.'
-        }));
-        console.log(`[Server] Restored state for ${playerName} in room ${currentRoom}`);
-      }
-
-      // 3. Notify other players in the room
+      // Notify other players in the room
       broadcast(currentRoom, { type: 'join', name: playerName }, ws);
 
-      // 4. Send list of online players to the new joiner
+      // Send list of online players to the new joiner
       const onlinePlayers = [];
       for (const client of clients) {
         if (client !== ws && client.playerName) {
@@ -239,11 +187,12 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'players', players: onlinePlayers }));
     }
 
-    // === BLOCK ===
+    // === BLOCK: player places/breaks a block ===
     else if (msg.type === 'block' && currentRoom) {
       const room = getRoom(currentRoom);
       const key = msg.x + ',' + msg.y + ',' + msg.z;
       if (msg.blockType === 0) {
+        // Air = block removed
         room.blocks.delete(key);
       } else {
         room.blocks.set(key, msg.blockType);
@@ -251,6 +200,7 @@ wss.on('connection', (ws) => {
       room.lastModified = Date.now();
       scheduleSave();
 
+      // Relay to all other players in the room
       broadcast(currentRoom, {
         type: 'block',
         x: msg.x, y: msg.y, z: msg.z,
@@ -260,8 +210,9 @@ wss.on('connection', (ws) => {
       }, ws);
     }
 
-    // === MOVE ===
+    // === MOVE: player position update ===
     else if (msg.type === 'move' && currentRoom) {
+      // Relay to other players (don't store — too much data)
       broadcast(currentRoom, {
         type: 'move',
         name: playerName,
@@ -269,32 +220,16 @@ wss.on('connection', (ws) => {
       }, ws);
     }
 
-    // === PLAYER STATE (client periodically sends its state for persistence) ===
-    else if (msg.type === 'player-state' && currentRoom) {
-      const playerMap = getPlayers(currentRoom);
-      playerMap.set(playerName, {
-        position: msg.state.position,
-        inventory: msg.state.inventory,
-        health: msg.state.health,
-        hunger: msg.state.hunger,
-        air: msg.state.air,
-        gamemode: msg.state.gamemode,
-        selectedSlot: msg.state.selectedSlot,
-        lastSeen: Date.now()
-      });
-      scheduleSave();
-    }
-
-    // === CHAT ===
+    // === CHAT: chat message ===
     else if (msg.type === 'chat' && currentRoom) {
       broadcast(currentRoom, {
         type: 'chat',
         name: playerName,
         message: msg.message
-      });
+      }); // include sender so everyone sees it
     }
 
-    // === ATTACK ===
+    // === ATTACK: PvP attack ===
     else if (msg.type === 'attack' && currentRoom) {
       broadcast(currentRoom, {
         type: 'attack',
@@ -302,24 +237,6 @@ wss.on('connection', (ws) => {
         name: playerName,
         damage: msg.damage
       });
-    }
-
-    // === LEAVE (client sends its final state before disconnecting) ===
-    else if (msg.type === 'leave' && currentRoom) {
-      if (msg.state) {
-        const playerMap = getPlayers(currentRoom);
-        playerMap.set(playerName, {
-          position: msg.state.position,
-          inventory: msg.state.inventory,
-          health: msg.state.health,
-          hunger: msg.state.hunger,
-          air: msg.state.air,
-          gamemode: msg.state.gamemode,
-          selectedSlot: msg.state.selectedSlot,
-          lastSeen: Date.now()
-        });
-        scheduleSave();
-      }
     }
   });
 
@@ -329,6 +246,8 @@ wss.on('connection', (ws) => {
       clients.delete(ws);
       console.log(`[Server] ${playerName} left room ${currentRoom} (${clients.size} players)`);
       broadcast(currentRoom, { type: 'leave', name: playerName });
+
+      // Clean up empty rooms from roomClients (but keep world state in rooms Map)
       if (clients.size === 0) {
         roomClients.delete(currentRoom);
       }
@@ -340,15 +259,29 @@ wss.on('connection', (ws) => {
   });
 });
 
+// Save rooms on shutdown
 process.on('SIGINT', () => {
-  console.log('[Server] Shutting down, saving state...');
-  saveAll();
+  console.log('[Server] Shutting down, saving rooms...');
+  const data = {};
+  for (const [code, room] of rooms) {
+    data[code] = {
+      blocks: Array.from(room.blocks.entries()),
+      seed: room.seed,
+      lastModified: room.lastModified
+    };
+  }
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+  } catch (e) {
+    console.error('[Server] Final save error:', e.message);
+  }
   process.exit(0);
 });
 
+// Periodic save every 30 seconds
 setInterval(scheduleSave, 30000);
 
-// Garbage collection: delete rooms/players older than 90 days
+// Clean up rooms older than 90 days with no blocks (garbage collection)
 setInterval(() => {
   const now = Date.now();
   const NINETY_DAYS = 90 * 24 * 60 * 60 * 1000;
@@ -358,22 +291,12 @@ setInterval(() => {
       console.log(`[Server] GC: deleted empty room ${code}`);
     }
   }
-  for (const [code, playerMap] of players) {
-    for (const [pname, pdata] of playerMap) {
-      if (now - (pdata.lastSeen || 0) > NINETY_DAYS) {
-        playerMap.delete(pname);
-        console.log(`[Server] GC: deleted inactive player ${pname} from room ${code}`);
-      }
-    }
-    if (playerMap.size === 0) players.delete(code);
-  }
-}, 3600000);
+}, 3600000); // hourly
 
 loadRooms();
-loadPlayers();
 
 server.listen(PORT, () => {
   console.log(`[Server] VoxelCraft server running on port ${PORT}`);
-  console.log(`[Server] Health: http://localhost:${PORT}/health`);
-  console.log(`[Server] WebSocket: ws://localhost:${PORT}/ws`);
+  console.log(`[Server] Health check: http://localhost:${PORT}/health`);
+  console.log(`[Server] WebSocket endpoint: ws://localhost:${PORT}/ws`);
 });
